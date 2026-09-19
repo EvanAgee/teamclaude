@@ -21,6 +21,7 @@ import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
 import { responsesEventUsage, isResponsesBody, normalizeResponsesUsage } from './responses-usage.js';
 import { classificationPath } from './classification-path.js';
+import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -2379,6 +2380,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // `anthropic-ratelimit-*` and Codex under `x-codex-*`; `updateQuota` picks
     // the parser by provider, so keeping only Anthropic's prefix handed a Codex
     // account an empty object and its quota never landed.
+    /** @type {Record<string, string>} */
     const rateLimitHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
       if (key.startsWith('anthropic-ratelimit-') || key.startsWith('x-codex-')) {
@@ -2427,19 +2429,49 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // account is futile — switch to another account now (updateQuota above
       // already recorded the spent bucket's utilization from the headers).
       const rl = rateLimitHeaders;
+      // A spent Codex window says the same thing as a rejected unified status,
+      // in the only vocabulary that backend has: a used-percent at its limit.
+      // Read through the same parser the quota sweep uses, so every family is
+      // covered — a subscription states its only 5-hour window inside a NAMED
+      // one. Without this a Codex 429 read as a transient throttle, so the
+      // account was never held: the pause lapsed, selection handed the spent
+      // subscription straight back, and the next request paid another refusal.
+      const spentCodexWindows = codexSpentWindows(rl);
+      // Only the account-wide windows are a general rejection. A named family's
+      // weekly bucket is model-scoped, like Anthropic's `7d_oi`: the account
+      // still serves every other model, so parking it would take a healthy
+      // account out of rotation for all of them. And nothing gates selection on
+      // the recorded model buckets, so once the hold lapsed the account would be
+      // picked again, refuse again and be parked again, for as long as that one
+      // bucket stayed spent.
+      const codexAccountSpent = spentCodexWindows.some(isAccountWideCodexWindow);
       const generalRejected = rl['anthropic-ratelimit-unified-5h-status'] === 'rejected'
-        || rl['anthropic-ratelimit-unified-7d-status'] === 'rejected';
+        || rl['anthropic-ratelimit-unified-7d-status'] === 'rejected'
+        || codexAccountSpent;
       const fableRejected = rl['anthropic-ratelimit-unified-7d_oi-status'] === 'rejected' && !generalRejected;
-      if ((generalRejected || fableRejected) && retryCount < maxRetries) {
+      const codexFamilyRejected = spentCodexWindows.length > 0 && !generalRejected;
+      if ((generalRejected || fableRejected || codexFamilyRejected) && retryCount < maxRetries) {
         // A Fable-only rejection leaves the account fine for other models, so we
         // do NOT throttle it globally — the recorded Fable utilization makes
         // selection skip it for Fable requests only. A general rejection spends a
         // shared bucket, so hold the whole account for its reset window.
         if (fableRejected) {
           console.log(`[TeamClaude] Fable weekly exhausted on "${account.name}" — switching account for this Fable request`);
+        } else if (codexFamilyRejected) {
+          // The same shape as the Fable case: this request moves to another
+          // account and the account itself is left alone. Unlike Fable, selection
+          // does not yet skip the account for this model family afterwards, so a
+          // later request for it pays one refusal here before it rotates.
+          console.log(`[TeamClaude] ${safeLine(spentCodexWindows.join(', '), 80)} spent on "${account.name}" — switching account for this request`);
         } else {
           const hold = Math.min(Math.max(retryAfter, 1), 3600);
-          console.log(`[TeamClaude] Quota rejection (429) on "${account.name}" — throttling ${hold}s and switching account`);
+          // Name the spent window when the headers said which: "which one" is
+          // the first thing an operator asks of a rejection, and a 5-hour
+          // window reads very differently from a weekly one. A model-scoped
+          // label carries upstream's own text, so it goes through safeLine.
+          const spent = spentCodexWindows.length
+            ? ` (${safeLine(spentCodexWindows.join(', '), 80)} spent)` : '';
+          console.log(`[TeamClaude] Quota rejection (429) on "${account.name}"${spent} — throttling ${hold}s and switching account`);
           accountManager.markRateLimited(account.index, hold);
         }
         ctx.tried.add(account.index);
