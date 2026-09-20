@@ -1,6 +1,7 @@
 import { formatMoney } from './oauth.js';
 import { findFamilyBlock, modelGlobOverlaps, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold, resolveFleetThreshold, switchThresholdDiffs } from './model.js';
 import { safeLine } from './safe-text.js';
+import { ROUTE_COLORS } from './config-ops.js';
 
 const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
@@ -297,7 +298,6 @@ function colors(enabled) {
 }
 
 // Paint a route's name/globs in its configured color, defaulting to cyan.
-const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
 function paintRoute(paint, color, value) {
   const fn = ROUTE_COLORS.includes(String(color || '').toLowerCase()) ? paint[color.toLowerCase()] : paint.cyan;
   return fn(value);

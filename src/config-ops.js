@@ -1,5 +1,5 @@
 import { DEFAULT_SWITCH_THRESHOLD, distributionMode } from './account-manager.js';
-import { THRESHOLD_BUCKET_KEYS } from './model.js';
+import { THRESHOLD_BUCKET_KEYS, WEEKLY_BUCKET_KEYS } from './model.js';
 import { createRollingWarmupSchedule, resolveWarmupSchedule } from './warmup-schedule.js';
 
 /**
@@ -138,6 +138,14 @@ export function thresholdRatio(percent) {
  * @returns {Record<string, number>}
  */
 export function thresholdTable(value) {
+  // Only a hand edit produces an array; the CLI and the TUI write a number or a
+  // keyed object. Spread, it became a table with a bucket named "0" that
+  // nothing ever asks about, while the threshold in force stayed the default
+  // and nothing said why (#425).
+  if (Array.isArray(value)) {
+    console.error('[TeamClaude] switchThreshold is an array in the config — expected a number or an object keyed by bucket; using the default');
+    return { default: DEFAULT_SWITCH_THRESHOLD };
+  }
   if (value && typeof value === 'object') {
     return { default: DEFAULT_SWITCH_THRESHOLD, ...value };
   }
@@ -263,6 +271,13 @@ export function upsertRoute(config, spec) {
   if (accounts.length) route.accounts = accounts;
   if (typeof spec.bucket === 'string' && spec.bucket) {
     refuseControlCharacters(spec.bucket, 'A route bucket');
+    // Stored verbatim, this becomes the route's weekly gating key. A typo names
+    // a bucket no account's quota map carries, so the route is never gated on
+    // its weekly window and nothing says so (#424). `threshold` refuses an
+    // unknown bucket for the same reason.
+    if (!WEEKLY_BUCKET_KEYS.includes(spec.bucket)) {
+      throw new ConfigOpError(`Unknown route bucket "${spec.bucket}" — expected one of: ${WEEKLY_BUCKET_KEYS.join(', ')}`);
+    }
     route.bucket = spec.bucket;
   }
   if (color) route.color = color;

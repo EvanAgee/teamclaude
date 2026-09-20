@@ -15,6 +15,9 @@ import { formatPercent, heldResetCredits } from './status-renderer.js';
 import { resolveMaxUsage, switchThresholdDiffs } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
 import { sanitizeText, safeLine } from './safe-text.js';
+// The setting rules live in one module; the CLI, the MCP tools and this screen
+// all read them from there, so they cannot drift apart (#426).
+import { MAX_PROBE_SECONDS, ROUTE_COLORS } from './config-ops.js';
 import { isLocalUpstream } from './provider.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
@@ -39,7 +42,6 @@ const FORCE_REPAINT_MS = 60_000;
 // a 32-bit millisecond delay: past 2,147,483 s setInterval overflows and fires
 // every millisecond, which is a probe storm rather than a slow probe. A week
 // is far under that and already longer than any quota window.
-const PROBE_MAX_SECONDS = 7 * 24 * 3600;
 const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
 const BOLD = `${ESC}1m`;
@@ -63,7 +65,6 @@ const NAMED_FG = {
   brightmagenta: 95, brightcyan: 96,
 };
 // Ordered list of the plain names, offered in the editor prompt / help.
-const ROUTE_COLOR_NAMES = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
 const isRouteColor = name => Object.prototype.hasOwnProperty.call(NAMED_FG, String(name || '').toLowerCase());
 // A paint function for a route's color, falling back to cyan for blank/unknown.
 const routeColorFn = name => {
@@ -573,6 +574,7 @@ export class TUI {
     this._setTimeout = setTimeout;
     this._origLog = null;
     this._origErr = null;
+    this._origWarn = null;
     // Set once the terminal has reported a failure. Everything that would
     // write to it checks this first.
     this._stdoutDead = false;
@@ -649,8 +651,12 @@ export class TUI {
     // Redirect console to activity log
     this._origLog = console.log;
     this._origErr = console.error;
+    this._origWarn = console.warn;
     console.log = (...a) => this._addLog(a.join(' '));
     console.error = (...a) => this._addLog(a.join(' '));
+    // warn as well: the one caller (an unrecognised distributeSessions value on
+    // reload) otherwise writes raw over the dashboard and misses the log (#414).
+    console.warn = (...a) => this._addLog(a.join(' '));
 
     this._lastFrame = null;   // entering the alt screen always paints
     this.render();
@@ -716,7 +722,7 @@ export class TUI {
     // Written now rather than dropped: quitting inside the debounce window
     // would otherwise lose the last arrangement the operator saw on screen.
     this._flushOrderSave();
-    if (this._origLog) { console.log = this._origLog; console.error = this._origErr; }
+    if (this._origLog) { console.log = this._origLog; console.error = this._origErr; if (this._origWarn) console.warn = this._origWarn; }
     if (this._activityStream) { this._activityStream.end(); this._activityStream = null; }
     process.stdin.removeListener('data', this._dataHandler);
     if (this._stdinErrorHandler) { process.stdin.removeListener('error', this._stdinErrorHandler); this._stdinErrorHandler = null; }
@@ -1123,8 +1129,8 @@ export class TUI {
     if (Number.isNaN(secs) || secs < 0) {
       this._addLog('Invalid interval — enter 0 (off) or seconds'); this.mode = 'settings'; if (this.running) this.render(); return;
     }
-    if (secs > PROBE_MAX_SECONDS) {
-      this._addLog(`Invalid interval — at most ${PROBE_MAX_SECONDS}s (7 days)`); this.mode = 'settings'; if (this.running) this.render(); return;
+    if (secs > MAX_PROBE_SECONDS) {
+      this._addLog(`Invalid interval — at most ${MAX_PROBE_SECONDS}s (7 days)`); this.mode = 'settings'; if (this.running) this.render(); return;
     }
     if (secs > 0 && secs < 30) secs = 30; // match the CLI minimum (don't hammer the usage endpoint)
     this.config.quotaProbeSeconds = secs;
@@ -2450,7 +2456,7 @@ export class TUI {
       selected: current,
       items: [
         { label: 'default', value: '' },
-        ...ROUTE_COLOR_NAMES.map(c => ({ label: c, value: c, paint: routeColorFn(c) })),
+        ...ROUTE_COLORS.map(c => ({ label: c, value: c, paint: routeColorFn(c) })),
       ],
       cb,
     });

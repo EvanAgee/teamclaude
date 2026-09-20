@@ -14,6 +14,7 @@ import {
   setWarmupSchedule,
   setWarmupSeconds,
   thresholdRatio,
+  thresholdTable,
   upsertRoute,
 } from '../src/config-ops.js';
 
@@ -191,4 +192,32 @@ test('the default client mode is one of the two the launcher understands', () =>
   setDefaultClientMode(config, 'mitm');
   assert.equal(config.defaultClientMode, 'mitm');
   refused(() => setDefaultClientMode(config, 'socks'), /mitm or base-url/);
+});
+
+// A route's `bucket` is stored verbatim and becomes its weekly gating key, so a
+// typo named a bucket no account carries and the route was silently never
+// weekly-gated (#424).
+test('an unknown route bucket is refused, with the valid ones named', () => {
+  const config = { routes: [], accounts: [] };
+  assert.throws(
+    () => upsertRoute(config, { name: 'opus', match: ['claude-opus-*'], bucket: 'unified7dFabel' }),
+    (err) => err instanceof ConfigOpError && /Unknown route bucket "unified7dFabel"/.test(err.message) && /unified7dFable/.test(err.message),
+  );
+  assert.deepEqual(config.routes, [], 'a refused route writes nothing');
+  assert.equal(upsertRoute(config, { name: 'opus', match: ['claude-opus-*'], bucket: 'unified7dFable' }).route.bucket, 'unified7dFable');
+});
+
+// Only a hand edit produces an array. Spread into the table it became a bucket
+// named "0" that nothing asks about (#425).
+test('an array switchThreshold is the default table, not numeric bucket keys', () => {
+  const origError = console.error;
+  const said = [];
+  console.error = (...a) => said.push(a.join(' '));
+  try {
+    assert.deepEqual(thresholdTable([0.9]), { default: 0.98 });
+  } finally {
+    console.error = origError;
+  }
+  assert.equal(said.length, 1);
+  assert.match(said[0], /switchThreshold is an array/);
 });
