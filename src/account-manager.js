@@ -1,7 +1,7 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, formatMoney } from './oauth.js';
 import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
-import { parseCodexQuota, parseCodexPlanType } from './codex-quota.js';
+import { parseCodexQuota, parseCodexPlanType, parseCodexActiveLimit } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
@@ -68,6 +68,9 @@ const ENTITLEMENT_DENIAL_COOLDOWN_SECONDS = 5 * 60;
 // Codex model-scoped weekly buckets are keyed by slugs taken from response
 // header NAMES, so the table needs a ceiling an upstream cannot talk past.
 const MAX_CODEX_MODEL_BUCKETS = 32;
+// The model-to-limit map is keyed by the model the CLIENT asked for, so it
+// needs the same ceiling for the same reason.
+const MAX_CODEX_MODEL_LIMITS = 32;
 
 // An `anthropic-ratelimit-*-reset` header (epoch seconds) as ms, or null when
 // it is not a positive finite number. Never NaN: see updateQuota.
@@ -131,6 +134,7 @@ const FAMILY_WEEKLY_BUCKETS = [
  * @property {string} [planType]  the Codex subscription tier
  * @property {{available: number, applicable: number|null, seenAt: number}} [resetCredits]  free rate-limit reset credits held, and when that was last seen
  * @property {Record<string, {name: string, utilization: number, resetAt: number|null, seenAt: number}>} [codexModelBuckets]  model-scoped weekly buckets, keyed by slug
+ * @property {Record<string, string>} [codexModelLimits]  which limit each model was last metered on, from `x-codex-active-limit`: a `codexModelBuckets` slug, or the name upstream gives the account-wide limit
  */
 
 function emptyQuota() {
@@ -3337,14 +3341,29 @@ export class AccountManager {
    * Only fields the response actually stated are assigned: a reading that a
    * given response did not carry must not blank what we already knew, and the
    * catalog fetch carries none at all.
+   *
+   * @param {string|null} [model] The model the client asked for, if any.
    */
-  _updateCodexQuota(account, headers) {
+  _updateCodexQuota(account, headers, model) {
     const parsed = parseCodexQuota(headers);
     const observed = new Set();
     // Header-derived strings are rendered into status and logs, so they are
     // stripped and bounded here rather than trusted from a third-party upstream.
     const plan = parseCodexPlanType(headers);
     if (plan) account.quota.planType = safeLine(plan, 64);
+
+    // Which limit metered this model. The response names it and nothing else
+    // does: the buckets say what each limit has left, not which models draw on
+    // it. Re-inserted on every sighting so key order is recency, and the entry
+    // seen longest ago makes room when the table is full.
+    const active = parseCodexActiveLimit(headers);
+    const key = model ? safeLine(model, 64).toLowerCase() : '';
+    if (active && key) {
+      const limits = (account.quota.codexModelLimits ??= {});
+      delete limits[key];
+      while (Object.keys(limits).length >= MAX_CODEX_MODEL_LIMITS) delete limits[Object.keys(limits)[0]];
+      limits[key] = safeLine(active, 64);
+    }
 
     if (parsed.unified5h != null) account.quota.unified5h = parsed.unified5h;
     if (parsed.unified7d != null) {
@@ -3399,7 +3418,7 @@ export class AccountManager {
     }
   }
 
-  updateQuota(accountIndex, headers) {
+  updateQuota(accountIndex, headers, model = null) {
     const account = this.accounts[accountIndex];
     if (!account) return;
 
@@ -3408,7 +3427,7 @@ export class AccountManager {
     // downstream — the switch threshold, reset countdowns, the TUI bars — then
     // works unchanged rather than needing a parallel Codex-shaped path.
     if (providerOf(account) === 'codex') {
-      this._updateCodexQuota(account, headers);
+      this._updateCodexQuota(account, headers, model);
       return;
     }
 

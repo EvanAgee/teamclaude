@@ -2593,7 +2593,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         rateLimitHeaders[key] = value;
       }
     }
-    accountManager.updateQuota(account.index, rateLimitHeaders);
+    accountManager.updateQuota(account.index, rateLimitHeaders, ctx.model);
 
     // Any non-429 response is live proof a rate-limit hold no longer binds —
     // this is what lets a revalidation probe (a throttled account selected by
