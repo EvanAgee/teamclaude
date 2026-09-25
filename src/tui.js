@@ -9,11 +9,12 @@ import {
   oauthIdentityFields,
 } from './identity.js';
 import { configIndexFor, managerAccountFor, markAccountRemoved } from './account-pairing.js';
-import { PROVIDERS, providerOf, isSubscriptionAccount } from './provider.js';
+import { PROVIDERS, providerOf, isSubscriptionAccount, upstreamFor } from './provider.js';
 import { mintAccountId } from './account-id.js';
 import { formatPercent, heldResetCredits } from './status-renderer.js';
 import { resolveMaxUsage, switchThresholdDiffs } from './model.js';
-import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
+import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy, localListener, isSelfProxy } from './upstream-proxy.js';
+import { describeRouting, parseRoutingUrl, routingToUrl, checkRouting } from './account-routing.js';
 import { sanitizeText, safeLine } from './safe-text.js';
 // The setting rules live in one module; the CLI, the MCP tools and this screen
 // all read them from there, so they cannot drift apart (#426).
@@ -356,6 +357,21 @@ export function switchThresholdTag(account, fleetFor) {
   return `switch ${parts.join(', ')}`;
 }
 
+/**
+ * "via socks5h://alice:***@host:1080" — the account's OWN egress proxy, or ''
+ * when it has none: the fleet path is the default and earns no tag. The live
+ * TUI reads the parsed object the manager holds; an attached dashboard reads
+ * the already-masked string the status payload carries (passwords never cross
+ * that boundary) — both land here.
+ * @param {any} account
+ */
+export function routingTag(account) {
+  const r = account?.routing;
+  if (!r) return '';
+  const text = typeof r === 'string' ? r : describeRouting(r);
+  return text ? `via ${text}` : '';
+}
+
 /** Fit a line to exactly w columns: truncate if too long, pad if too short.
  *  Truncation drops a wide glyph that would straddle the limit, so the result
  *  can come up one column short; pad that too — the frame is repainted in
@@ -525,6 +541,8 @@ export class TUI {
     // Injectable so the import path can be exercised without a real credentials
     // file or a live profile call.
     readCredentials = importCredentials, readProfile = fetchProfile,
+    // Injectable so setting an account's proxy can be exercised without one.
+    testRouting = checkRouting,
     // Names the activity column against the session id the client sent. Absent
     // or disabled leaves every row showing the short id.
     sessionTitles = null,
@@ -545,6 +563,7 @@ export class TUI {
     this.activityLogPath = activityLogPath;
     this._readCredentials = readCredentials;
     this._readProfile = readProfile;
+    this._testRouting = testRouting;
     this._activityStream = null;
     this.sessionTitles = sessionTitles;
     this.versionLabel = versionLabel;
@@ -555,7 +574,7 @@ export class TUI {
     this.mode = 'normal';    // normal | select | add | input | settings | pick
     this.pick = null;        // active list picker (routes editor accounts/bucket/color)
     this.pickReturn = 'routes'; // mode to fall back to when the picker closes
-    this.selAction = null;   // switch | remove | toggle | reorder
+    this.selAction = null;   // switch | remove | toggle | reorder | routing
     this.selIdx = 0;
     this.selRoute = null;    // in switch mode: null = global default, else a getRoutes() entry to pin
     this.selReturn = 'normal'; // mode to fall back to when select mode closes
@@ -831,6 +850,17 @@ export class TUI {
     if (d === '\x03') return this._key('ctrl-c');
     if (d === '\x7f' || d === '\x08') return this._key('bs');
     if (d.length === 1 && d >= ' ') return this._key(d);
+    // A paste arrives as ONE chunk of many characters, which the line above
+    // turns away, so a pasted proxy URL or API key vanished without a sign,
+    // and those are exactly the values nobody types by hand. Only a text
+    // prompt takes it, and never anything holding an escape: that is a key
+    // sequence this parser does not know, not text. Control characters are
+    // dropped, the clipboard's trailing newline among them, so a paste fills
+    // the prompt and the operator still presses Enter on what they can see.
+    if (this.mode === 'input' && d.length > 1 && !d.includes('\x1b')) {
+      this.inputBuf += d.replace(/[\x00-\x1f\x7f]/g, '');
+      this.render();
+    }
   }
 
   _key(k) {
@@ -1041,6 +1071,23 @@ export class TUI {
       enter: () => this._promptInput('Upstream proxy (host:port, or blank for direct)', v => this._doSetUpstreamProxy(v.trim())),
     });
 
+    // ONE account's own proxy (accounts[].routing), beside the fleet's: the two
+    // answer the same question at different scopes. Named "proxy", not
+    // "routing": "Manage routing" above is the per-model routes screen, and two
+    // rows sharing a word would send the operator to the wrong one.
+    if (this.am.accounts.length > 0) {
+      fields.push({
+        id: 'accountProxy',
+        label: 'Account proxy',
+        hint: 'Enter to pick',
+        value: () => {
+          const n = this.am.accounts.filter((/** @type {any} */ a) => a.routing).length;
+          return n ? green(`${n} of ${this.am.accounts.length} routed`) : dim('(none)');
+        },
+        enter: () => { this.mode = 'select'; this.selAction = 'routing'; this.selIdx = this._displayOrder()[0] ?? 0; this.selReturn = 'settings'; },
+      });
+    }
+
     if (this.sx) {
       fields.push({
         id: 'sxmode',
@@ -1204,6 +1251,10 @@ export class TUI {
         // Every move is already applied, so Enter only means "done" — and it
         // has to be caught here, ahead of the remove branch below, which is
         // what an unlisted action falls into.
+      } else if (this.selAction === 'routing') {
+        // Opens the URL prompt, which leaves select mode by itself; the mode
+        // check below then has nothing to undo.
+        this._promptAccountRouting(this.selIdx);
       } else {
         this._doRemove(this.selIdx);
       }
@@ -1383,6 +1434,65 @@ export class TUI {
     else if (resolved.source === 'self') this._addLog(`Connecting directly — ${describeSelfProxy(resolved)}`);
     else this._addLog('Upstream proxy cleared — connecting directly');
     this.mode = 'settings';
+  }
+
+  /** @param {number} idx */
+  _promptAccountRouting(idx) {
+    const acct = this.am.accounts[idx];
+    if (!acct) return;
+    // `none`, as the CLI and the MCP tool spell it: _promptInput drops a blank
+    // entry, which is the right meaning for blank here too (no change).
+    this._promptInput(`Proxy for ${safeLine(acct.name, 40)} (URL${acct.routing ? ', or none to clear' : ''})`,
+      (/** @type {string} */ v) => this._doSetAccountRouting(idx, v.trim()));
+  }
+
+  /** Set or clear one account's own proxy. A new URL is tested first, as the
+   *  CLI does, and for a stronger reason: here the change is live the moment it
+   *  is made, so a mistyped password would take a serving account out of
+   *  rotation with the operator watching.
+   *  @param {number} idx
+   *  @param {string} value */
+  async _doSetAccountRouting(idx, value) {
+    const acct = this.am.accounts[idx];
+    if (!acct) return;
+    let routing = null;
+    if (!/^(none|off|-)$/i.test(value)) {
+      try {
+        routing = parseRoutingUrl(value);
+      } catch (/** @type {any} */ e) {
+        this._addLog(`Invalid proxy: ${e.message}`);
+        return;
+      }
+      if (!routing) return;
+      // Our own listener would pass the test below (this server answers a
+      // CONNECT) and then loop every request straight back in.
+      if (isSelfProxy(routing, localListener(this.config))) {
+        this._addLog(`Proxy not set: ${describeRouting(routing)} is this server's own address, and would loop back into it`);
+        return;
+      }
+      this._addLog(`Testing ${describeRouting(routing)}...`);
+      if (this.running) this.render();
+      const check = await this._testRouting(routing, upstreamFor(acct, this.config.upstream));
+      if (!check.ok) {
+        this._addLog(`Proxy not set: ${check.error}`);
+        if (this.running) this.render();
+        return;
+      }
+    }
+
+    // Resolved before the await below: a manager index is not a config index
+    // (see _doToggleDisabled).
+    const cfgIdx = configIndexFor(this.config.accounts, this.am.accounts, idx);
+    this.am.setRouting(idx, routing);
+    // An explicit null, not a deleted key: the save merges over the on-disk
+    // entry, and a missing key would leave the old `routing` standing.
+    if (cfgIdx >= 0) this.config.accounts[cfgIdx].routing = routing ? routingToUrl(routing) : null;
+    try { await this.saveConfig(this.config); }
+    catch (/** @type {any} */ e) { this._addLog(`Failed to save: ${e.message}`); }
+    this._addLog(routing
+      ? `"${safeLine(acct.name, 64)}" now leaves through ${describeRouting(routing)}`
+      : `Cleared the proxy for "${safeLine(acct.name, 64)}"; it uses the fleet egress`);
+    if (this.running) this.render();
   }
 
   // ── sx.org settings ────────────────────────────────
@@ -1567,6 +1677,11 @@ export class TUI {
           if (amAcct.status === 'error') amAcct.status = 'active';
         }
         this._addLog(`Updated account "${prev.name}"`);
+        // Which account a credential belongs to is only known once its profile
+        // has been read, so that one lookup cannot go through a proxy it has
+        // not found yet. Said, because the operator routed this account to
+        // keep its traffic off this machine's address.
+        if (prev.routing) this._addLog(`Note: "${safeLine(prev.name, 64)}" has its own proxy, and this import's profile lookup did not go through it`);
       } else {
         // New org for this person: disambiguate colliding email names with " (org)".
         if (profile?.accountUuid) {
@@ -1905,6 +2020,21 @@ export class TUI {
     }
     } // end non-settings body
 
+    // A body taller than the terminal used to push the footer off the bottom,
+    // and the footer is where a prompt is typed: on a settings screen longer
+    // than the window, the operator typed a value they could not see into a
+    // prompt they could not read. The header and footer now always stay, and
+    // the body between them is a window that follows the cursor row.
+    const HEADER_H = 2;
+    const bodyRoom = H - footerH - HEADER_H;
+    if (lines.length - HEADER_H > bodyRoom) {
+      const body = lines.slice(HEADER_H);
+      const at = Math.max(0, body.findIndex(l => strip(l).includes('▸')));
+      const from = Math.max(0, Math.min(body.length - bodyRoom, at - Math.floor(bodyRoom / 2)));
+      lines.length = HEADER_H;
+      lines.push(...body.slice(from, from + bodyRoom));
+    }
+
     // Pad to fill
     while (lines.length < H - footerH) lines.push('');
 
@@ -1986,7 +2116,13 @@ export class TUI {
         const tag = switchThresholdTag(a, key => this.am.thresholdFor(key));
         return tag ? Math.max(w, 2 + vw(tag)) : w;
       }, 0);
-      const fixed = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + switchW;
+      // Same rule again for the routing tag: silent for every account on the
+      // fleet path, so it costs the budget nothing there.
+      const routeW = members.reduce((/** @type {number} */ w, /** @type {any} */ a) => {
+        const tag = routingTag(a);
+        return tag ? Math.max(w, 2 + vw(tag)) : w;
+      }, 0);
+      const fixed = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + switchW + routeW;
       const span = (/** @type {number} */ n, /** @type {number} */ bar) => fixed + 6 * (n - 1) + n * bar;
       const roomFor = (/** @type {number} */ n) => span(n, BAR_MIN) <= W;
       // No Ses bar once every Codex account here has said it meters no 5h window
@@ -2356,6 +2492,10 @@ export class TUI {
     // the fleet's own numbers) — see switchThresholdTag.
     const switchTag = switchThresholdTag(a, key => this.am.thresholdFor(key));
     if (switchTag) line += `  ${cyan(switchTag)}`;
+    // Routing tag trails even that: where the account's traffic physically
+    // leaves the machine, when the operator pinned it to its own proxy.
+    const routeTag = routingTag(a);
+    if (routeTag) line += `  ${cyan(routeTag)}`;
     return line;
   }
 
@@ -2423,8 +2563,13 @@ export class TUI {
     // not disappear along with an unrelated integration.
     lines.push(bold('  Network') + dim('  — how this machine reaches Anthropic'));
     lines.push(row(byId('upstreamProxy')));
+    if (byId('accountProxy')) lines.push(row(byId('accountProxy')));
     lines.push(dim('  Set when the machine has no direct route out (HTTPS_PROXY is'));
     lines.push(dim('  picked up automatically). Applies to requests, login and refresh.'));
+    if (byId('accountProxy')) {
+      lines.push(dim('  An account proxy carries ONE account instead, all of its traffic:'));
+      lines.push(dim('  socks5h://user:pass@host:1080 (also socks5, socks4a, socks4, http).'));
+    }
     lines.push('');
     // ── sx.org
     lines.push(bold('  sx.org proxy') + dim('  — route upstream via a residential IP (429 workaround)'));
@@ -2771,7 +2916,8 @@ export class TUI {
         if (this.selAction === 'reorder') {
           return ` ${dim('↑↓')} select  ${dim('←→')} move  ${bold('Enter')}/${bold('Esc')} done`;
         }
-        const act = this.selAction === 'toggle' ? 'enable/disable' : 'remove';
+        const act = this.selAction === 'toggle' ? 'enable/disable'
+          : this.selAction === 'routing' ? 'set its proxy' : 'remove';
         return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;
       }
       case 'add':

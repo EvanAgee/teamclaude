@@ -80,9 +80,86 @@ teamclaude enable <name>        # re-enable it (also clears a stuck error state)
 teamclaude priority <name> 1    # rotation preference, lower = preferred
 teamclaude priority <name> --first
 teamclaude priority <name> --last
+teamclaude routing <name> <url> # route ALL of the account's traffic via its own proxy
+teamclaude routing <name> none  # clear it
+teamclaude routing <name> --check  # test the proxy the account already has
 ```
 
-`login`, `import`, `enable`, `disable` and `priority` notify a running server to reload, so credential, priority and enable/disable changes are picked up live; the same reload (POST `/teamclaude/reload`, or **R** in the TUI) also applies hand edits to an account's `upstream`/`modelMap`. Account **removals** made on disk still need a restart, because a reload never drops a running account; removing one from the TUI or through the [MCP endpoint](usage.md#mcp-endpoint)'s `remove_account` takes effect at once.
+`login`, `import`, `enable`, `disable`, `priority` and `routing` notify a running server to reload, so credential, priority, enable/disable and routing changes are picked up live; the same reload (POST `/teamclaude/reload`, or **R** in the TUI) also applies hand edits to an account's `upstream`/`modelMap`. Account **removals** made on disk still need a restart, because a reload never drops a running account; removing one from the TUI or through the [MCP endpoint](usage.md#mcp-endpoint)'s `remove_account` takes effect at once.
+
+## Per-account routing (`routing`)
+
+One account can leave through its own proxy while the rest of the fleet goes direct (or through the fleet [upstream proxy](proxy-modes.md#upstream-proxy)):
+
+```bash
+teamclaude login --name "waffles@waffle.com" --routing "socks5h://alice:s3cret@proxy.example.com:1080"
+teamclaude routing waffles@waffle.com socks5h://alice:s3cret@proxy.example.com:1080
+teamclaude routing waffles@waffle.com        # show it (password masked)
+teamclaude routing waffles@waffle.com --check  # show it, and test the proxy
+teamclaude routing waffles@waffle.com none   # clear it
+```
+
+Or in the config:
+
+```json
+{ "name": "waffles@waffle.com", "type": "oauth", "routing": "socks5h://alice:s3cret@proxy.example.com:1080" }
+```
+
+**Every** connection made for that account (request forwarding, OAuth login and token refresh, profile, usage and quota probes) tunnels through the proxy with TLS end to end, and no other account is touched. A routed account bypasses both the fleet upstream proxy and sx.org: the contract is that its traffic never leaves by another path, so even a post-429 sx retry goes through the account's own proxy.
+
+Schemes:
+
+| Scheme | Protocol | Hostname resolution |
+| --- | --- | --- |
+| `http` | HTTP `CONNECT` | at the proxy |
+| `socks5` | SOCKS5 | locally |
+| `socks5h` | SOCKS5 | at the proxy |
+| `socks4` | SOCKS4 | locally (IPv4 only) |
+| `socks4a` | SOCKS4 | at the proxy |
+
+Optional `user:pass@` auth works for `http` and `socks5`/`socks5h` (SOCKS4 carries a username only, so a password there is refused with a message). A bare `host:port` is read as `http`. The `h`/`a` forms are usually what you want for a remote exit: the proxy resolves the hostname, so the exit's DNS view matches its geography.
+
+The value is validated when the account is read: a bad URL is reported once and ignored, never fatal, and so is a URL that names this server's own address, which would send the account's requests straight back into the proxy (the CLI, the TUI and the MCP tool refuse to store one). It shows masked in `teamclaude accounts`, `status`, the TUI and the web dashboard, and the reload note above applies to disk edits and `routing` changes alike. The proxy password is masked everywhere it is printed, error messages and the MCP write log included. `teamclaude api --account <name>` sends the account's credential, so it leaves through the account's proxy as well. Changed alongside: `teamclaude api` used to bypass the fleet [upstream proxy](proxy-modes.md#upstream-proxy) too, and now goes through it when one is configured, like every other call TeamClaude makes with an account's credential.
+
+Besides the CLI there are two more places to set it. In the TUI, **`g`** then **Account proxy** picks an account and asks for the URL (`none` clears it). Over the [MCP endpoint](usage.md#mcp-endpoint) the tool is `set_account_routing`.
+
+### What is not routed
+
+Routing covers what TeamClaude does with the account's own credential. Two kinds of traffic are outside that, and both keep the fleet path:
+
+- Claude Code's own identity calls (`/api/oauth/*`, `/v1/code/*` and its token refresh) are relayed with the credential of the Claude Code login, never with a pooled account's, so they belong to no account here. That holds even when the login is the same person as a routed account.
+- A sign-in or import that names no account. Which account it belongs to is only known once the profile has been read, so that lookup cannot use a proxy it has not found yet. Pass `--name` (or `--routing`) and it can.
+
+### The proxy is tested before anything depends on it
+
+`login --routing`, `import --routing`, `routing <name> <url>` and the TUI row all open a tunnel through the proxy to the account's upstream and finish the TLS handshake before they change anything. No request is sent, so the only credential that leaves the machine is the proxy's own. If the test fails the command stops and nothing is saved:
+
+```
+$ teamclaude routing waffles@waffle.com socks5h://alice:wrong@proxy.example.com:1080
+Routing proxy check failed: account routing proxy socks5h://alice:***@proxy.example.com:1080: SOCKS5 authentication failed
+Nothing was changed. Fix the proxy or the URL, or pass --no-check to skip this test.
+```
+
+For an OAuth login this is what saves the sign-in. The authorisation code works once, so a wrong proxy password found at the token exchange would cost you the whole browser flow. Pass `--no-check` when the proxy is not up yet.
+
+`--routing URL` and `--routing=URL` both work. A `--routing` with nothing after it is an error and is never ignored: the account would otherwise be added from this machine's own address, and that is the one outcome the flag exists to prevent.
+
+### Signing a routed account in again
+
+`teamclaude login --name "waffles@waffle.com"` reuses the routing that account already has, so a re-login leaves through the same proxy without the URL being typed again. The stored value is only borrowed for the sign-in and is left as it was.
+
+If that proxy is dead and the account needs a new sign-in now, add `--routing none`. That signs in without a proxy and clears the stored routing, the same way `teamclaude routing <name> none` does.
+
+Without `--name`, TeamClaude cannot know which account a sign-in belongs to until it is over. If it turns out to be a routed account, the command says that the sign-in went out unrouted and how to route the next one.
+
+### When the proxy is down
+
+A proxy that refuses connections, times out or rejects its credentials takes only its own account with it. The request that found out fails over to the next account. The routed account is then held out of rotation for 30 seconds, so the requests behind it do not each wait on a dead proxy, and the first request after the hold tries the proxy again.
+
+While the hold lasts, `status`, the TUI and the dashboard show the account as blocked with "the account's routing proxy is unreachable", and the server log names the account and its masked proxy. When every eligible account is in that state the client gets a `429` whose message says so and whose `retry-after` is the rest of the hold, not a quota reset. A request pinned to the account (`TC_ACCT`) still goes to it. Changing the account's routing lifts the hold at once.
+
+Two fleet features reason about this machine's own exit address, which a routed account no longer uses. A `429` on a routed account does not trigger the [sx.org](proxy-modes.md#sxorg-proxy-mode) retry or its sticky window. The `egress.pin` check runs before an account is chosen, so while the machine's own exit IP is wrong it holds every request, including ones a routed account could have served.
+
 
 Accounts can also be added, removed and reordered from the TUI settings screen: **`g`** → **Add account** / **Remove account** / **Reorder accounts**.
 
