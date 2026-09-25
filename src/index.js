@@ -25,7 +25,7 @@ import { resolveAccounts } from './resolve-accounts.js';
 import { loginCodex } from './codex-auth.js';
 import { providerOf } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
-import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds } from './account-pairing.js';
+import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
 import * as alias from './alias.js';
 import { ensureCerts, mitmHosts } from './mitm.js';
@@ -419,12 +419,13 @@ async function serverCommand() {
 
   // Re-sync accounts from disk without a restart. The TUI's 'R' key, the
   // POST /teamclaude/reload endpoint, and the CLI notify after add/change all
-  // funnel through here. Returns the number of newly added accounts. Also picks
+  // funnel through here. Returns { added, removed }: accounts picked up from
+  // disk and running accounts dropped because their entry is gone. Also picks
   // up a changed probe interval so `teamclaude probe` applies live.
-  const reloadAccounts = async () => {
+  const doReload = async () => {
     const diskConfig = await loadConfig();
-    if (!diskConfig) return 0;
-    const added = await syncAccountsFromDisk(diskConfig, config, accountManager);
+    if (!diskConfig) return { added: 0, removed: 0 };
+    const { added, removed } = await syncAccountsFromDisk(diskConfig, config, accountManager);
     // Pick up client-key edits (proxy.clientKeys is read live by both auth
     // gates through the shared config object, so refreshing it here is all a
     // key add/rotate/revoke needs — no restart).
@@ -518,7 +519,21 @@ async function serverCommand() {
         config.warmupSeconds = diskConfig.warmupSeconds || 0;
       }
     }
-    return added;
+    return { added, removed };
+  };
+  // One reload at a time. The sync awaits a credential re-import per
+  // importFrom account, and a second reload started in that gap (the TUI's R
+  // while a CLI notify is in flight, say) would pair disk rows against a
+  // manager list the first is still changing — and, now that a reload removes,
+  // could drop an account by an index the other reload has already shifted.
+  // Each caller waits for the previous reload to settle, whichever way it
+  // settled, and then runs its own against the list as it stands.
+  /** @type {Promise<unknown>} */
+  let reloading = Promise.resolve();
+  const reloadAccounts = () => {
+    const next = reloading.catch(() => {}).then(doReload);
+    reloading = next;
+    return next;
   };
 
   // The account half of a save. The TUI's save below starts with it, and the
@@ -534,6 +549,9 @@ async function serverCommand() {
     // is nothing left to re-adopt. Holding the ids any longer would only
     // refuse an account the operator re-adds later.
     clearRemovedAccountIds(config);
+    // And carries the additions, so a reload from now on finds their rows on
+    // disk and has no reason to drop them.
+    clearAddedAccountIds(config);
   };
 
   let tui = null;
@@ -2760,9 +2778,8 @@ function startTerminalTitleUpdater(accountManager) {
 // Best-effort: tell a running server (if any) to re-sync accounts from config so
 // CLI changes take effect without a restart. A closed local port refuses the
 // connection immediately, so this is a no-op (and near-instant) when nothing is
-// running. Reload picks up new accounts, credential, priority, and enable/disable
-// changes, plus eventLogging and blockedModels edits; account removals still
-// need a restart.
+// running. Reload picks up new and removed accounts, credential, priority, and
+// enable/disable changes, plus eventLogging and blockedModels edits.
 async function notifyRunningServer(config) {
   const port = config?.proxy?.port;
   if (!port) return;
@@ -2773,7 +2790,11 @@ async function notifyRunningServer(config) {
     });
     if (res.ok) {
       const data = await res.json().catch(() => ({}));
-      console.log(`Reloaded running server${data.added ? ` (+${data.added} new account)` : ''}.`);
+      /** @type {string[]} */
+      const parts = [];
+      if (data.added) parts.push(`+${data.added} new account`);
+      if (data.removed) parts.push(`-${data.removed} removed account`);
+      console.log(`Reloaded running server${parts.length ? ` (${parts.join(', ')})` : ''}.`);
     }
   } catch { /* no server running — nothing to notify */ }
 }
